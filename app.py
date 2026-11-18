@@ -11874,3 +11874,326 @@ if _q2a_show:
 # =============================================================================================
 # ################  END SECTION: FIG 2a  ######################################################
 # =============================================================================================
+
+
+# ==================== ADDITION: SUPPLEMENTARY TABLES S1 AND S2 ====================
+# This section only reads completed grouped-validation results. The original
+# sampling, preprocessing, models, validation and existing downloads above are unchanged.
+
+def _pv_sup_input_signature(uploaded):
+    """Identify workbook bytes without changing the upload's stream position."""
+    import hashlib
+    return hashlib.sha256(uploaded.getvalue()).hexdigest()
+
+
+def _pv_sup_run_context(uploaded, state, mode, preview_sheet):
+    """Bind an export to the exact completed run and workbook."""
+    return {
+        "input_sha256": _pv_sup_input_signature(uploaded),
+        "input_name": str(getattr(uploaded, "name", "uploaded_workbook.xlsx")),
+        "run_timestamp": state.get("pv_run_timestamp"),
+        "run_display": state.get("pv_run_timestamp_display", "unknown"),
+        "seed": int(state["pv_seed_used"]),
+        "requested_spectra": int(state["pv_n_per_animal_used"]),
+        "models": tuple(state["pv_model_choices"]),
+        "mode": mode,
+        "preview_sheet": preview_sheet if mode.startswith("Just") else None,
+    }
+
+
+def _pv_sup_context_matches(context, uploaded, state, mode, preview_sheet):
+    """Never offer old results after the workbook or analysis settings change."""
+    if not context or uploaded is None or not state.get("pv_has_results"):
+        return False
+    if context["input_sha256"] != _pv_sup_input_signature(uploaded):
+        return False
+    if context["run_timestamp"] != state.get("pv_run_timestamp"):
+        return False
+    if context["mode"] != mode:
+        return False
+    if context["preview_sheet"] is not None and context["preview_sheet"] != preview_sheet:
+        return False
+    if int(state.get("pv_n", context["requested_spectra"])) != context["requested_spectra"]:
+        return False
+    if int(state.get("pv_seed", context["seed"])) != context["seed"]:
+        return False
+    if tuple(state.get("pv_models", context["models"])) != context["models"]:
+        return False
+    if tuple(state.get("pv_model_choices", ())) != context["models"]:
+        return False
+    if int(state.get("pv_n_per_animal_used", -1)) != context["requested_spectra"]:
+        return False
+    return int(state.get("pv_seed_used", -1)) == context["seed"]
+
+
+def _pv_sup_read_labels(workbook_bytes, sheets):
+    """Read class labels from this upload; never assume animal IDs or WT/OIM classes."""
+    import io
+    import pandas as pd
+    labels = {}
+    with pd.ExcelFile(io.BytesIO(workbook_bytes)) as book:
+        for sheet in sheets:
+            if sheet not in book.sheet_names:
+                raise ValueError(f"The current workbook does not contain the evaluated sheet {sheet!r}.")
+            header = book.parse(sheet, nrows=0)
+            normal = {str(c).strip().lower(): c for c in header.columns}
+            group_col = next((normal[k] for k in ("sample id", "animal id", "mouse id", "id") if k in normal), None)
+            label_col = next((normal[k] for k in ("type", "class", "label", "group", "genotype")
+                              if k in normal and normal[k] != group_col), None)
+            if group_col is None or label_col is None:
+                raise ValueError(f"Cannot identify the sample ID and class columns in {sheet!r}.")
+            meta = book.parse(sheet, usecols=[group_col, label_col]).dropna(how="all")
+            if meta[[group_col, label_col]].isna().any().any():
+                raise ValueError(f"{sheet}: a sample ID or class label is missing; the supplementary labels cannot be verified.")
+            meta[group_col] = meta[group_col].astype(str)
+            meta[label_col] = meta[label_col].astype(str)
+            mapping = {}
+            for sample_id, block in meta.groupby(group_col, sort=False):
+                classes = block[label_col].unique()
+                if len(classes) != 1:
+                    raise ValueError(f"{sheet}: sample {sample_id!r} has more than one class label.")
+                mapping[sample_id] = str(classes[0])
+            labels[sheet] = mapping
+    return labels
+
+
+def _pv_sup_build_workbook(all_results, labels_by_sheet, context, region_bounds=None):
+    """Export S1/S2 as numeric snapshots of the completed LOGO run, without refitting."""
+    import io
+    import math
+    from statistics import mean, stdev
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    if not all_results:
+        raise ValueError("There are no completed grouped-validation results to export.")
+    region_bounds = region_bounds or {}
+    order_sheet = {"Raw": 0, "2nd derivative": 1, "Quant peak ratios": 2}
+    order_region = {"Fingerprint": 0, "Collagen": 1, "Mineral": 2, "ratio": 3}
+    preferred_models = ["Logistic Regression", "SVM", "KNN", "Random Forest", "XGBoost"]
+    combinations = sorted(all_results, key=lambda k: (order_sheet.get(k[0], 99), str(k[0]),
+                                                       order_region.get(k[1], 99), str(k[1])))
+    panels, summaries, source_rows = [], [], []
+    for sheet, region in combinations:
+        per_model = all_results[(sheet, region)]
+        models = [m for m in preferred_models if m in per_model]
+        models += sorted(m for m in per_model if m not in preferred_models)
+        if not models:
+            continue
+        if sheet not in labels_by_sheet:
+            raise ValueError(f"Missing class labels for {sheet!r}.")
+        classes = labels_by_sheet[sheet]
+        records_by_model = {}
+        expected_counts = None
+        for model in models:
+            result = per_model[model]
+            folds = result["fold_table"].copy(deep=True)
+            id_col = next((c for c in ("Held-out Sample ID", "Held-out animal", "Animal") if c in folds.columns), None)
+            if id_col is None or not {"Test spectra", "Fold accuracy"}.issubset(folds.columns):
+                raise ValueError(f"{sheet}/{region}/{model}: per-animal fold results are incomplete.")
+            if folds.empty or folds[id_col].isna().any():
+                raise ValueError(f"{sheet}/{region}/{model}: animal IDs are missing.")
+            folds[id_col] = folds[id_col].astype(str)
+            if folds[id_col].duplicated().any():
+                raise ValueError(f"{sheet}/{region}/{model}: an animal appears in more than one fold.")
+            if len(folds) < 2:
+                raise ValueError("At least two held-out animals are needed to report a sample SD.")
+            records = {}
+            for _, row in folds.iterrows():
+                sample = str(row[id_col])
+                count = float(row["Test spectra"])
+                accuracy = float(row["Fold accuracy"])
+                if sample not in classes:
+                    raise ValueError(f"{sheet}: result sample {sample!r} is absent from the uploaded labels.")
+                if not math.isfinite(count) or count <= 0 or count != int(count):
+                    raise ValueError(f"{sheet}/{model}: invalid test count for sample {sample!r}.")
+                if not math.isfinite(accuracy) or not 0 <= accuracy <= 1:
+                    raise ValueError(f"{sheet}/{model}: invalid accuracy for sample {sample!r}.")
+                count = int(count)
+                if not math.isclose(accuracy * count, round(accuracy * count), abs_tol=1e-7, rel_tol=0):
+                    raise ValueError(f"{sheet}/{model}: accuracy and test count disagree for sample {sample!r}.")
+                records[sample] = (count, accuracy)
+            counts = {sample: value[0] for sample, value in records.items()}
+            if expected_counts is not None and counts != expected_counts:
+                raise ValueError(f"{sheet}/{region}: models do not evaluate the same animals and test counts.")
+            expected_counts = counts
+            values = [v[1] for v in records.values()]
+            pooled = sum(n * a for n, a in records.values()) / sum(n for n, a in records.values())
+            if not math.isclose(pooled, float(result["overall_accuracy"]), rel_tol=0, abs_tol=1e-12):
+                raise ValueError(f"{sheet}/{region}/{model}: fold accuracies do not reproduce the pooled accuracy.")
+            summaries.append((sheet, region, model, mean(values), stdev(values) * 100,
+                              min(values), max(values), len(values), pooled))
+            records_by_model[model] = records
+        # Keep the actual input order and classes; no fixed 12-animal or WT/OIM list.
+        animals = [sample for sample in classes if sample in expected_counts]
+        panels.append((sheet, region, models, animals, records_by_model))
+        for model in models:
+            for sample in animals:
+                count, accuracy = records_by_model[model][sample]
+                source_rows.append((sheet, region, model, sample, count, accuracy, classes[sample]))
+    if not panels:
+        raise ValueError("No evaluated models are available for supplementary tables.")
+
+    wb = Workbook()
+    s1 = wb.active
+    s1.title = "S1 Animal accuracy"
+    s2 = wb.create_sheet("S2 Variability")
+    source = wb.create_sheet("Source data")
+    dark = "233F63"
+    for ws in (s1, s2, source):
+        ws.sheet_view.showGridLines = False
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+
+    def write(ws, row, col, value):
+        cell = ws.cell(row=row, column=col, value=value)
+        if isinstance(value, str):
+            cell.data_type = "s"  # Preserve uploaded IDs/classes as literal text.
+        cell.font = Font(name="Arial", size=11, color="182536")
+        cell.alignment = Alignment(vertical="center", horizontal="right" if isinstance(value, (int, float)) else "left")
+        return cell
+
+    def title(ws, text):
+        write(ws, 2, 1, text).font = Font(name="Arial", size=15, bold=True)
+
+    def note(ws, row, text):
+        write(ws, row, 1, text).font = Font(name="Arial", size=10, color="556374")
+
+    def header(ws, row, names):
+        ws.row_dimensions[row].height = 38
+        for col, name in enumerate(names, 1):
+            cell = write(ws, row, col, name)
+            cell.fill = PatternFill("solid", fgColor=dark)
+            cell.font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    title(s1, "Supplementary Table S1")
+    note(s1, 4, "Accuracy for each held-out animal across the classifiers evaluated in this run")
+    note(s1, 5, "Values are percentages. Test counts are the actual spectra evaluated for each animal.")
+    note(s1, 6, "Only completed representations and selected models are included.")
+    row = 9
+    for index, (sheet, region, models, animals, records) in enumerate(panels):
+        panel = chr(65 + index) if index < 26 else str(index + 1)
+        bounds = region_bounds.get(region)
+        suffix = f" ({bounds[0]}-{bounds[1]} cm-1)" if bounds is not None else ""
+        write(s1, row, 1, f"{panel}  {sheet} - {region}{suffix}").font = Font(name="Arial", size=12, bold=True)
+        header(s1, row + 1, ["Animal", "Phenotype", "Test spectra"] + models)
+        for offset, sample in enumerate(animals, 2):
+            write(s1, row + offset, 1, sample)
+            write(s1, row + offset, 2, labels_by_sheet[sheet][sample])
+            write(s1, row + offset, 3, records[models[0]][sample][0])
+            for col, model in enumerate(models, 4):
+                write(s1, row + offset, col, records[model][sample][1]).number_format = "0.0%"
+        row += len(animals) + 5
+    note(s1, row, "Per-animal accuracy = correct held-out predictions divided by that animal's test spectra.")
+    s1.freeze_panes = "D11"
+
+    title(s2, "Supplementary Table S2")
+    note(s2, 4, "Variation in classification accuracy across the held-out animals")
+    note(s2, 5, "SD is the sample standard deviation of animal accuracies, expressed in percentage points.")
+    note(s2, 6, "Minimum and maximum define the observed range; animal counts are specific to each evaluated combination.")
+    header(s2, 8, ["Representation", "Feature set", "Classifier", "Mean accuracy", "SD percentage points",
+                   "Minimum accuracy", "Maximum accuracy", "Animals"])
+    for row, record in enumerate(summaries, 9):
+        for col, value in enumerate(record[:8], 1):
+            cell = write(s2, row, col, value)
+            if col in (4, 6, 7):
+                cell.number_format = "0.00%" if col == 4 else "0.0%"
+            elif col == 5:
+                cell.number_format = "0.00"
+    foot = 10 + len(summaries)
+    note(s2, foot, "The mean gives each animal equal weight. Pooled spectral accuracy can differ when animal test counts differ.")
+    note(s2, foot + 1, "SD describes between-animal variation; it is not a confidence interval or repeated-run uncertainty.")
+    s2.freeze_panes = "D9"
+
+    title(source, "Source results from the completed validation run")
+    note(source, 4, f"Input: {context['input_name']} | Run: {context['run_display']} | Seed: {context['seed']}")
+    note(source, 5, f"Input SHA256: {context['input_sha256']}")
+    note(source, 6, f"Requested spectra per animal: {context['requested_spectra']}. Export reuses held-out predictions; no models are refitted.")
+    header(source, 8, ["Representation", "Feature set", "Classifier", "Held out animal", "Test spectra", "Exported accuracy", "Phenotype"])
+    for row, record in enumerate(source_rows, 9):
+        for col, value in enumerate(record, 1):
+            cell = write(source, row, col, value)
+            if col == 6:
+                cell.number_format = "0.0%"
+    # Retain the pooled metric as well, including runs with unequal per-animal counts.
+    for col, name in enumerate(["Representation", "Feature set", "Classifier", "Pooled accuracy"], 9):
+        cell = write(source, 8, col, name)
+        cell.fill = PatternFill("solid", fgColor=dark)
+        cell.font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row, record in enumerate(summaries, 9):
+        for col, value in enumerate((record[0], record[1], record[2], record[8]), 9):
+            cell = write(source, row, col, value)
+            if col == 12:
+                cell.number_format = "0.00%"
+    source.freeze_panes = "D9"
+    source.auto_filter.ref = f"A8:G{len(source_rows) + 8}"
+    for ws in (s1, s2, source):
+        for r in range(1, ws.max_row + 1):
+            if ws.row_dimensions[r].height is None:
+                ws.row_dimensions[r].height = 23
+        for col in range(1, ws.max_column + 1):
+            ws.column_dimensions[get_column_letter(col)].width = 23 if col > 2 else 22
+        ws.print_options.horizontalCentered = True
+    s1.column_dimensions["A"].width = 18
+    s1.column_dimensions["B"].width = 18
+    s1.column_dimensions["C"].width = 17
+    s1.print_area = f"A1:{get_column_letter(s1.max_column)}{s1.max_row}"
+    s2.print_area = f"A1:H{s2.max_row}"
+    output = io.BytesIO()
+    wb.save(output)
+    return output.getvalue()
+
+
+def _pv_sup_render_export_panel(st_module, uploaded, namespace):
+    """Add one isolated export panel; never alter the existing result objects."""
+    state = st_module.session_state
+    mode = namespace.get("_pv_mode", "")
+    preview_sheet = namespace.get("_pv_preview_sheet")
+    # Streamlit button state is true only on the run-validation click. The
+    # original success timestamp confirms that the current run finished.
+    if state.get("pv_run", False):
+        state.pop("pv_supplementary_context", None)
+        state.pop("pv_supplementary_xlsx", None)
+        completed = namespace.get("_pv_run_dt")
+        if (uploaded is not None and not namespace.get("_pv_failed", True)
+                and completed is not None and state.get("pv_has_results")
+                and completed.strftime("%Y%m%d_%H%M%S") == state.get("pv_run_timestamp")):
+            state["pv_supplementary_context"] = _pv_sup_run_context(uploaded, state, mode, preview_sheet)
+
+    st_module.markdown("---")
+    st_module.subheader("Supplementary tables S1 and S2")
+    st_module.caption("Export each animal's accuracy and the mean, SD and range across animals for this validation run.")
+    context = state.get("pv_supplementary_context")
+    if not _pv_sup_context_matches(context, uploaded, state, mode, preview_sheet):
+        st_module.info("Run validation with the current workbook and settings to enable its supplementary tables.")
+        return
+    if st_module.button("Generate supplementary Excel (S1 and S2)", key="pv_supplementary_generate"):
+        state.pop("pv_supplementary_xlsx", None)
+        try:
+            with st_module.spinner("Preparing supplementary tables..."):
+                results = state["pv_all_results"]
+                sheets = list(dict.fromkeys(sheet for sheet, _ in results))
+                labels = _pv_sup_read_labels(uploaded.getvalue(), sheets)
+                state["pv_supplementary_xlsx"] = _pv_sup_build_workbook(
+                    results, labels, context, namespace.get("_REGIONS", {}))
+        except Exception as error:
+            st_module.error(f"The supplementary workbook could not be verified: {error}")
+    if state.get("pv_supplementary_xlsx"):
+        st_module.download_button(
+            "Download supplementary tables S1 and S2 (.xlsx)",
+            data=state["pv_supplementary_xlsx"],
+            file_name=f"Reviewer1_Comment1_Supplementary_Tables_{context['run_timestamp']}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="pv_supplementary_download",
+        )
+
+
+if globals().get("show_professor_panel", False):
+    _pv_sup_render_export_panel(st, globals().get("_pv_uploaded"), globals())
+# ================== END ADDITION: SUPPLEMENTARY TABLES S1 AND S2 ==================
